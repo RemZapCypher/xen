@@ -167,6 +167,7 @@ static SIMPLE_TEXT_OUTPUT_INTERFACE *__initdata StdErr;
 
 static UINT32 __initdata mdesc_ver;
 static bool __initdata map_bs;
+static bool __initdata opt_bgrt_disabled = false;
 
 static struct file __initdata cfg;
 static struct file __initdata kernel;
@@ -867,6 +868,9 @@ static void __init efi_preserve_bgrt_img(EFI_SYSTEM_TABLE *SystemTable)
 
     bgrt_debug_info.preserved = false;
     bgrt_debug_info.failure_reason = NULL;
+
+    if ( opt_bgrt_disabled )
+        return;
 
     bgrt = find_bgrt_table(SystemTable);
     if ( !bgrt )
@@ -1873,6 +1877,10 @@ static int __init cf_check parse_efi_param(const char *s)
             else
                 __clear_bit(EFI_RS, &efi_flags);
         }
+        else if ( (ss - s) == 7 && !memcmp(s, "no-bgrt", 7) )
+        {
+            opt_bgrt_disabled = true;
+        }
         else if ( (ss - s) > 5 && !memcmp(s, "attr=", 5) )
         {
             if ( !cmdline_strcmp(s + 5, "uc") )
@@ -1968,7 +1976,11 @@ void __init efi_init_memory(void)
     if ( !efi_enabled(EFI_BOOT) )
         return;
 
-    if ( bgrt_debug_info.preserved )
+    if ( opt_bgrt_disabled )
+    {
+        printk(XENLOG_INFO "EFI: BGRT preservation disabled\n");
+    }
+    else if ( bgrt_debug_info.preserved )
     {
         printk(XENLOG_INFO "EFI: BGRT image preserved: %u KB\n",
                bgrt_debug_info.size / 1024);
