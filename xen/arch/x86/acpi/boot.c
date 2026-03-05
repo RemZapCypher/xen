@@ -327,27 +327,6 @@ static int __init cf_check acpi_parse_hpet(struct acpi_table_header *table)
 	return 0;
 }
 
-static int __init cf_check acpi_invalidate_bgrt(struct acpi_table_header *table)
-{
-	struct acpi_table_bgrt *bgrt_tbl =
-		container_of(table, struct acpi_table_bgrt, header);
-
-	if (table->length < sizeof(*bgrt_tbl))
-		return -1;
-
-	if (bgrt_tbl->version == 1 && bgrt_tbl->image_address
-	    && !page_is_ram_type(PFN_DOWN(bgrt_tbl->image_address),
-				 RAM_TYPE_CONVENTIONAL))
-		return 0;
-
-	printk(KERN_INFO PREFIX "BGRT: invalidating v%d image at %#"PRIx64"\n",
-	       bgrt_tbl->version, bgrt_tbl->image_address);
-	bgrt_tbl->image_address = 0;
-	bgrt_tbl->status &= ~1;
-
-	return 0;
-}
-
 #define acpi_fadt_copy_address(dst, src, len) do {			\
 	if (fadt->header.revision >= FADT2_REVISION_ID &&		\
 	    fadt->header.length >= ACPI_FADT_V2_SIZE)			\
@@ -751,8 +730,6 @@ int __init acpi_boot_init(void)
 	erst_init();
 
 	acpi_hest_init();
-
-	acpi_table_parse(ACPI_SIG_BGRT, acpi_invalidate_bgrt);
 
 	return 0;
 }

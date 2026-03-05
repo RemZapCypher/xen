@@ -7,6 +7,7 @@
 #include <xen/ctype.h>
 #include <xen/dmi.h>
 #include <xen/domain_page.h>
+#include <xen/errno.h>
 #include <xen/init.h>
 #include <xen/keyhandler.h>
 #include <xen/lib.h>
@@ -172,6 +173,14 @@ static struct file __initdata kernel;
 static struct file __initdata ramdisk;
 static struct file __initdata xsm;
 static const CHAR16 __initconst newline[] = L"\r\n";
+
+static __initdata struct {
+    bool preserved;
+    uint64_t old_addr;
+    uint64_t new_addr;
+    uint32_t size;
+    const char *failure_reason;
+} bgrt_debug_info;
 
 static void __init PrintStr(const CHAR16 *s)
 {
@@ -745,6 +754,190 @@ static void __init efi_relocate_esrt(EFI_SYSTEM_TABLE *SystemTable)
     }
 
     efi_bs->FreePool(memory_map);
+}
+
+struct bmp_header {
+    uint16_t signature;
+    uint32_t file_size;
+    uint16_t reserved_1;
+    uint16_t reserved_2;
+    uint32_t data_offset;
+} __attribute__((packed));
+
+/*
+ * ACPI Structures - defined locally,
+ * since we cannot include acpi headers
+ * in EFI Context.
+ */
+
+struct acpi_rsdp {
+    char signature[8];
+    uint8_t checksum;
+    char oem_id[6];
+    uint8_t revision;
+    uint32_t rsdt_physical_address;
+    uint32_t length;
+    uint64_t xsdt_physical_address;
+    uint8_t extended_checksum;
+    uint8_t reserved[3];
+} __attribute__((packed));
+
+struct acpi_table_header {
+    char signature[4];
+    uint32_t length;
+    uint8_t revision;
+    uint8_t checksum;
+    char oem_id[6];
+    char oem_table_id[8];
+    uint32_t oem_revision;
+    uint32_t asl_compiler_id;
+    uint32_t asl_compiler_revision;
+} __attribute__((packed));
+
+struct acpi_xsdt {
+    struct acpi_table_header header;
+    uint64_t table_offset_entry[1]; /* Variable array length */
+} __attribute__((packed));
+
+struct acpi_bgrt {
+    struct acpi_table_header header;
+    uint16_t version;
+    uint8_t status;
+    uint8_t image_type;
+    uint64_t image_address;
+    uint32_t image_offset_x;
+    uint32_t image_offset_y;
+} __attribute__((packed));
+
+#define ACPI_SIG_BGRT           "BGRT"   /* Boot Graphics Resource Table */
+
+static struct acpi_bgrt* __init find_bgrt_table(EFI_SYSTEM_TABLE *SystemTable)
+{
+    EFI_GUID acpi2_guid = ACPI_20_TABLE_GUID;
+    struct acpi_rsdp *rsdp = NULL;
+    struct acpi_xsdt *xsdt;
+    struct acpi_bgrt *bgrt;
+    uint32_t entry_count, actual_size;
+    unsigned int i;
+
+    for (i = 0; i < SystemTable->NumberOfTableEntries; i++)
+    {
+        if (match_guid(&acpi2_guid, &SystemTable->ConfigurationTable[i].VendorGuid))
+        {
+            rsdp = SystemTable->ConfigurationTable[i].VendorTable;
+            break;
+        }
+    }
+
+    if (!rsdp || !rsdp->xsdt_physical_address)
+        return NULL;
+
+    xsdt = (struct acpi_xsdt *)rsdp->xsdt_physical_address;
+    if (!xsdt)
+        return NULL;
+
+    actual_size = (xsdt->header.length - sizeof(struct acpi_table_header));
+    entry_count = (actual_size / sizeof(uint64_t));
+
+    for (i = 0; i < entry_count; i++)
+    {
+        struct acpi_table_header *header = (struct acpi_table_header *)xsdt->table_offset_entry[i];
+
+        if (   header->signature[0] == 'B'
+            && header->signature[1] == 'G'
+            && header->signature[2] == 'R'
+            && header->signature[3] == 'T' )
+        {
+            bgrt = (struct acpi_bgrt *)header;
+            return bgrt;
+        }
+    }
+    return NULL;
+}
+
+#define MAX_IMAGE_SIZE  (16 * 1024 * 1024)    /* Sanity check: reject if bigger */
+
+static void __init efi_preserve_bgrt_img(EFI_SYSTEM_TABLE *SystemTable)
+{
+    struct acpi_bgrt *bgrt;
+    struct bmp_header *bmp;
+    void *old_image, *new_image;
+    uint32_t image_size;
+    EFI_STATUS status;
+    uint8_t checksum;
+    unsigned int i;
+
+    /* Initialize debug info */
+    bgrt_debug_info.preserved = false;
+    bgrt_debug_info.failure_reason = NULL;
+
+    PrintStr(L"EFI: Attempting BGRT preservation...\r\n");
+
+    bgrt = find_bgrt_table(SystemTable);
+    if (!bgrt)
+    {
+        PrintStr(L"EFI: BGRT table not found\r\n");
+        bgrt_debug_info.failure_reason = "BGRT table not found in XSDT";
+        return;
+    }
+
+    if (!bgrt->image_address)
+    {
+        PrintStr(L"EFI: BGRT image_address is NULL\r\n");
+        bgrt_debug_info.failure_reason = "BGRT image_address is NULL";
+        return;
+    }
+
+    PrintStr(L"EFI: BGRT found, image_address=");
+    DisplayUint(bgrt->image_address, 16);
+    PrintStr(L"\r\n");
+
+    old_image = (void *)bgrt->image_address;
+    bmp = (struct bmp_header *)old_image;
+
+    if (bmp->signature != 0x4D42)
+    {
+        PrintStr(L"EFI: Invalid BMP signature\r\n");
+        bgrt_debug_info.failure_reason = "Invalid BMP signature";
+        return;
+    }
+
+    image_size = bmp->file_size;
+    if (!image_size || image_size > MAX_IMAGE_SIZE)
+    {
+        PrintStr(L"EFI: Invalid image size: ");
+        DisplayUint(image_size, 10);
+        PrintStr(L"\r\n");
+        bgrt_debug_info.failure_reason = "Invalid image size";
+        return;
+    }
+
+    PrintStr(L"EFI: Valid BMP found, size=");
+    DisplayUint(image_size, 10);
+    PrintStr(L" bytes\r\n");
+
+    status = efi_bs->AllocatePool(EfiACPIReclaimMemory, image_size, &new_image);
+    if (status != EFI_SUCCESS || !new_image)
+    {
+        bgrt_debug_info.failure_reason = "Memory allocation failed";
+        return;
+    }
+
+    memcpy(new_image, old_image, image_size);
+
+    bgrt_debug_info.preserved = true;
+    bgrt_debug_info.old_addr = (uint64_t)old_image;
+    bgrt_debug_info.new_addr = (uint64_t)new_image;
+    bgrt_debug_info.size = image_size;
+
+    bgrt->image_address = (uint64_t)new_image;
+    bgrt->status |= 0x01;
+
+    bgrt->header.checksum = 0;
+    checksum = 0;
+
+    for (i = 0; i < bgrt->header.length; i++) checksum += ((uint8_t *)bgrt)[i];
+    bgrt->header.checksum = (uint8_t)(0 - checksum);
 }
 
 /*
@@ -1793,6 +1986,19 @@ void __init efi_init_memory(void)
 
     if ( !efi_enabled(EFI_BOOT) )
         return;
+
+    if ( bgrt_debug_info.preserved )
+    {
+        printk(XENLOG_INFO "EFI: BGRT image preserved: %u KB\n",
+               bgrt_debug_info.size / 1024);
+        printk(XENLOG_INFO "EFI: BGRT relocated from %#" PRIx64 " to %#" PRIx64 "\n",
+               bgrt_debug_info.old_addr, bgrt_debug_info.new_addr);
+    }
+    else if ( bgrt_debug_info.failure_reason )
+    {
+        printk(XENLOG_WARNING "EFI: BGRT preservation failed: %s\n",
+               bgrt_debug_info.failure_reason);
+    }
 
     printk(XENLOG_DEBUG "EFI memory map:%s\n",
            map_bs ? " (mapping BootServices)" : "");
