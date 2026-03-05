@@ -167,6 +167,7 @@ static SIMPLE_TEXT_OUTPUT_INTERFACE *__initdata StdErr;
 
 static UINT32 __initdata mdesc_ver;
 static bool __initdata map_bs;
+static bool __initdata opt_bgrt_disabled = false;
 
 static struct file __initdata cfg;
 static struct file __initdata kernel;
@@ -809,8 +810,6 @@ struct acpi_bgrt {
     uint32_t image_offset_y;
 } __attribute__((packed));
 
-#define ACPI_SIG_BGRT           "BGRT"   /* Boot Graphics Resource Table */
-
 static struct acpi_bgrt* __init find_bgrt_table(EFI_SYSTEM_TABLE *SystemTable)
 {
     EFI_GUID acpi2_guid = ACPI_20_TABLE_GUID;
@@ -871,33 +870,27 @@ static void __init efi_preserve_bgrt_img(EFI_SYSTEM_TABLE *SystemTable)
     bgrt_debug_info.preserved = false;
     bgrt_debug_info.failure_reason = NULL;
 
-    PrintStr(L"EFI: Attempting BGRT preservation...\r\n");
+    if (opt_bgrt_disabled)
+        return;
 
     bgrt = find_bgrt_table(SystemTable);
     if (!bgrt)
     {
-        PrintStr(L"EFI: BGRT table not found\r\n");
         bgrt_debug_info.failure_reason = "BGRT table not found in XSDT";
         return;
     }
 
     if (!bgrt->image_address)
     {
-        PrintStr(L"EFI: BGRT image_address is NULL\r\n");
         bgrt_debug_info.failure_reason = "BGRT image_address is NULL";
         return;
     }
-
-    PrintStr(L"EFI: BGRT found, image_address=");
-    DisplayUint(bgrt->image_address, 16);
-    PrintStr(L"\r\n");
 
     old_image = (void *)bgrt->image_address;
     bmp = (struct bmp_header *)old_image;
 
     if (bmp->signature != 0x4D42)
     {
-        PrintStr(L"EFI: Invalid BMP signature\r\n");
         bgrt_debug_info.failure_reason = "Invalid BMP signature";
         return;
     }
@@ -905,16 +898,9 @@ static void __init efi_preserve_bgrt_img(EFI_SYSTEM_TABLE *SystemTable)
     image_size = bmp->file_size;
     if (!image_size || image_size > MAX_IMAGE_SIZE)
     {
-        PrintStr(L"EFI: Invalid image size: ");
-        DisplayUint(image_size, 10);
-        PrintStr(L"\r\n");
         bgrt_debug_info.failure_reason = "Invalid image size";
         return;
     }
-
-    PrintStr(L"EFI: Valid BMP found, size=");
-    DisplayUint(image_size, 10);
-    PrintStr(L" bytes\r\n");
 
     status = efi_bs->AllocatePool(EfiACPIReclaimMemory, image_size, &new_image);
     if (status != EFI_SUCCESS || !new_image)
@@ -925,19 +911,19 @@ static void __init efi_preserve_bgrt_img(EFI_SYSTEM_TABLE *SystemTable)
 
     memcpy(new_image, old_image, image_size);
 
-    bgrt_debug_info.preserved = true;
-    bgrt_debug_info.old_addr = (uint64_t)old_image;
-    bgrt_debug_info.new_addr = (uint64_t)new_image;
-    bgrt_debug_info.size = image_size;
-
     bgrt->image_address = (uint64_t)new_image;
     bgrt->status |= 0x01;
 
     bgrt->header.checksum = 0;
     checksum = 0;
-
-    for (i = 0; i < bgrt->header.length; i++) checksum += ((uint8_t *)bgrt)[i];
+    for ( i = 0; i < bgrt->header.length; i++ )
+        checksum += ((uint8_t *)bgrt)[i];
     bgrt->header.checksum = (uint8_t)(0 - checksum);
+
+    bgrt_debug_info.preserved = true;
+    bgrt_debug_info.old_addr = (uint64_t)old_image;
+    bgrt_debug_info.new_addr = (uint64_t)new_image;
+    bgrt_debug_info.size = image_size;
 }
 
 /*
@@ -1892,6 +1878,10 @@ static int __init cf_check parse_efi_param(const char *s)
             else
                 __clear_bit(EFI_RS, &efi_flags);
         }
+        else if ( (ss - s) == 7 && !memcmp(s, "no-bgrt", 7) )
+        {
+            opt_bgrt_disabled = true;
+        }
         else if ( (ss - s) > 5 && !memcmp(s, "attr=", 5) )
         {
             if ( !cmdline_strcmp(s + 5, "uc") )
@@ -1987,7 +1977,11 @@ void __init efi_init_memory(void)
     if ( !efi_enabled(EFI_BOOT) )
         return;
 
-    if ( bgrt_debug_info.preserved )
+    if ( opt_bgrt_disabled )
+    {
+        printk(XENLOG_INFO "EFI: BGRT preservation disabled\n");
+    }
+    else if ( bgrt_debug_info.preserved )
     {
         printk(XENLOG_INFO "EFI: BGRT image preserved: %u KB\n",
                bgrt_debug_info.size / 1024);
