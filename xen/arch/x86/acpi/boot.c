@@ -29,6 +29,7 @@
 #include <xen/mm.h>
 #include <xen/param.h>
 #include <xen/dmi.h>
+#include <xen/efi.h>
 #include <asm/fixmap.h>
 #include <asm/page.h>
 #include <asm/apic.h>
@@ -758,6 +759,8 @@ int __init acpi_boot_init(void)
 	acpi_hest_init();
 
 	acpi_table_parse(ACPI_SIG_BGRT, acpi_invalidate_bgrt);
+
+	efi_bgrt_status_info();
 
 	return 0;
 }

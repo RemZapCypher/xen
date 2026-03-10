@@ -797,7 +797,7 @@ struct acpi_table_header {
 
 struct acpi_xsdt {
     struct acpi_table_header header;
-    uint64_t table_offset_entry[1]; /* Variable array length */
+    uint64_t table_offset_entry[];
 } __attribute__((packed));
 
 struct acpi_bgrt {
@@ -815,7 +815,6 @@ static struct acpi_bgrt* __init find_bgrt_table(EFI_SYSTEM_TABLE *SystemTable)
     EFI_GUID acpi2_guid = ACPI_20_TABLE_GUID;
     struct acpi_rsdp *rsdp = NULL;
     struct acpi_xsdt *xsdt;
-    struct acpi_bgrt *bgrt;
     uint32_t entry_count, actual_size;
     unsigned int i;
 
@@ -835,6 +834,14 @@ static struct acpi_bgrt* __init find_bgrt_table(EFI_SYSTEM_TABLE *SystemTable)
     if ( !xsdt )
         return NULL;
 
+    /* Validate XSDT signature */
+    if ( strncmp(xsdt->header.signature, "XSDT", 4) != 0 )
+        return NULL;
+
+    /* Bounds check */
+    if ( xsdt->header.length < sizeof(struct acpi_table_header) )
+        return NULL;
+
     actual_size = (xsdt->header.length - sizeof(struct acpi_table_header));
     entry_count = (actual_size / sizeof(uint64_t));
 
@@ -842,13 +849,17 @@ static struct acpi_bgrt* __init find_bgrt_table(EFI_SYSTEM_TABLE *SystemTable)
     {
         struct acpi_table_header *header = (struct acpi_table_header *)xsdt->table_offset_entry[i];
 
-        if (   header->signature[0] == 'B'
-            && header->signature[1] == 'G'
-            && header->signature[2] == 'R'
-            && header->signature[3] == 'T' )
+        /* Validate table address */
+        if ( !header )
+            continue;
+
+        if ( !strncmp(header->signature, "BGRT", 4) )
         {
-            bgrt = (struct acpi_bgrt *)header;
-            return bgrt;
+            /* Validate BGRT table size */
+            if ( header->length < sizeof(struct acpi_bgrt) )
+                return NULL;
+            
+            return (struct acpi_bgrt *)header;
         }
     }
     return NULL;
@@ -885,6 +896,13 @@ static void __init efi_preserve_bgrt_img(EFI_SYSTEM_TABLE *SystemTable)
         return;
     }
 
+    /* Validate image address is not obviously invalid */
+    if ( bgrt->image_address < 0x1000 )
+    {
+        bgrt_debug_info.failure_reason = "BGRT image_address too low";
+        return;
+    }
+
     old_image = (void *)bgrt->image_address;
     bmp = (struct bmp_header *)old_image;
 
@@ -911,7 +929,6 @@ static void __init efi_preserve_bgrt_img(EFI_SYSTEM_TABLE *SystemTable)
     memcpy(new_image, old_image, image_size);
 
     bgrt->image_address = (uint64_t)new_image;
-    bgrt->status |= 0x01;
 
     bgrt->header.checksum = 0;
     checksum = 0;
@@ -1629,6 +1646,8 @@ void EFIAPI __init noreturn efi_start(EFI_HANDLE ImageHandle,
                     base_video = true;
                 else if ( wstrcmp(ptr + 1, L"mapbs") == 0 )
                     map_bs = true;
+                else if ( wstrcmp(ptr + 1, L"nobgrt") == 0 )
+                    opt_bgrt_disabled = true;
                 else if ( wstrncmp(ptr + 1, L"cfg=", 4) == 0 )
                     cfg_file_name = ptr + 5;
                 else if ( i + 1 < argc && wstrcmp(ptr + 1, L"cfg") == 0 )
@@ -1639,6 +1658,7 @@ void EFIAPI __init noreturn efi_start(EFI_HANDLE ImageHandle,
                     PrintStr(L"Xen EFI Loader options:\r\n");
                     PrintStr(L"-basevideo   retain current video mode\r\n");
                     PrintStr(L"-mapbs       map EfiBootServices{Code,Data}\r\n");
+                    PrintStr(L"-nobgrt      disable BGRT preservation\r\n");
                     PrintStr(L"-cfg=<file>  specify configuration file\r\n");
                     PrintStr(L"-help, -?    display this help\r\n");
                     blexit(NULL);
@@ -1848,6 +1868,8 @@ void EFIAPI __init noreturn efi_start(EFI_HANDLE ImageHandle,
         efi_set_gop_mode(gop, gop_mode);
 
     efi_relocate_esrt(SystemTable);
+    
+    efi_preserve_bgrt_img(SystemTable);
 
     efi_exit_boot(ImageHandle, SystemTable);
 
@@ -1960,19 +1982,8 @@ static bool __init cf_check rt_range_valid(unsigned long smfn, unsigned long emf
     return true;
 }
 
-
-void __init efi_init_memory(void)
+void __init efi_bgrt_status_info(void)
 {
-    unsigned int i;
-    l4_pgentry_t *efi_l4t;
-    struct rt_extra {
-        struct rt_extra *next;
-        unsigned long smfn, emfn;
-        pte_attr_t prot;
-    } *extra, *extra_head = NULL;
-
-    free_ebmalloc_unused_mem();
-
     if ( !efi_enabled(EFI_BOOT) )
         return;
 
@@ -1992,6 +2003,22 @@ void __init efi_init_memory(void)
         printk(XENLOG_WARNING "EFI: BGRT preservation failed: %s\n",
                bgrt_debug_info.failure_reason);
     }
+}
+
+void __init efi_init_memory(void)
+{
+    unsigned int i;
+    l4_pgentry_t *efi_l4t;
+    struct rt_extra {
+        struct rt_extra *next;
+        unsigned long smfn, emfn;
+        pte_attr_t prot;
+    } *extra, *extra_head = NULL;
+
+    free_ebmalloc_unused_mem();
+
+    if ( !efi_enabled(EFI_BOOT) )
+        return;
 
     printk(XENLOG_DEBUG "EFI memory map:%s\n",
            map_bs ? " (mapping BootServices)" : "");
