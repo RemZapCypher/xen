@@ -150,9 +150,6 @@ static bool read_file(EFI_FILE_HANDLE dir_handle, CHAR16 *name,
 static bool read_section(const EFI_LOADED_IMAGE *image, const CHAR16 *name,
                          struct file *file, const char *options);
 
-static const struct acpi_table_bgrt *efi_get_bgrt(void);
-static void efi_preserve_bgrt_img(void);
-
 static void efi_init(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable);
 static void efi_console_set_mode(void);
 static EFI_GRAPHICS_OUTPUT_PROTOCOL *efi_get_gop(EFI_HANDLE *gop_handle);
@@ -760,7 +757,7 @@ typedef struct {
     UINT32 file_size;
     UINT16 reserved[2];
     UINT32 data_offset;
-} BMP_HEADER;
+} __attribute__((packed)) BMP_HEADER;
 
 static __initdata struct {
     bool preserved;
@@ -872,12 +869,12 @@ static void __init efi_preserve_bgrt_img(void)
     ((struct acpi_table_bgrt *)bgrt)->image_address = (UINTN)new_image;
     ((struct acpi_table_bgrt *)bgrt)->header.checksum = 0;
     checksum = 0;
-    
+
     for ( i = 0; i < bgrt->header.length; i++ )
         checksum += ((const UINT8 *)bgrt)[i];
-    
+
     ((struct acpi_table_bgrt *)bgrt)->header.checksum = -checksum;
-    
+
     /* Filling the debug struct for printing later */
     bgrt_info.preserved = true;
     bgrt_info.old_addr = old_image;
@@ -1811,7 +1808,7 @@ void EFIAPI __init noreturn efi_start(EFI_HANDLE ImageHandle,
         efi_set_gop_mode(gop, gop_mode);
 
     efi_relocate_esrt(SystemTable);
-    
+
     efi_preserve_bgrt_img();
 
     efi_exit_boot(ImageHandle, SystemTable);
