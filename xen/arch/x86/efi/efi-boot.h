@@ -910,6 +910,8 @@ void __init efi_multiboot2(EFI_HANDLE ImageHandle,
 
     efi_relocate_esrt(SystemTable);
 
+    efi_preserve_bgrt_img();
+
     efi_exit_boot(ImageHandle, SystemTable);
 }
 

@@ -1,12 +1,16 @@
 #include "efi.h"
 #include <efi/efiprot.h>
 #include <efi/efipciio.h>
+#include <acpi/acconfig.h>
+#include <acpi/actbl.h>
+#include <acpi/actbl3.h>
 #include <public/xen.h>
 #include <xen/bitops.h>
 #include <xen/compile.h>
 #include <xen/ctype.h>
 #include <xen/dmi.h>
 #include <xen/domain_page.h>
+#include <xen/errno.h>
 #include <xen/init.h>
 #include <xen/keyhandler.h>
 #include <xen/lib.h>
@@ -745,6 +749,133 @@ static void __init efi_relocate_esrt(EFI_SYSTEM_TABLE *SystemTable)
     }
 
     efi_bs->FreePool(memory_map);
+}
+
+typedef struct {
+    UINT16 signature;
+    UINT32 file_size;
+    UINT16 reserved[2];
+    UINT32 data_offset;
+} __attribute__((packed)) BMP_HEADER;
+
+static __initdata struct {
+    bool preserved;
+    const void *old_addr;
+    const void *new_addr;
+    UINTN size;
+    const char *failure_reason;
+} bgrt_info = {
+    /* We would prefer the failure_reason to print */
+    .failure_reason = "",
+};
+
+static struct acpi_table_bgrt *__init efi_get_bgrt(void)
+{
+    const struct acpi_table_rsdp *rsdp;
+    const struct acpi_table_xsdt *xsdt;
+    UINTN entry_count;
+    unsigned int i;
+
+    if ( efi.acpi20 == EFI_INVALID_TABLE_ADDR )
+        return NULL;
+
+    rsdp = (const void *)(UINTN)efi.acpi20;
+    if ( !rsdp || !rsdp->xsdt_physical_address )
+        return NULL;
+
+    xsdt = (const void *)rsdp->xsdt_physical_address;
+
+    if ( memcmp(xsdt->header.signature, ACPI_SIG_XSDT, 4) != 0 )
+        return NULL;
+
+    if ( xsdt->header.length < sizeof(xsdt->header) )
+        return NULL;
+    entry_count = (xsdt->header.length - sizeof(xsdt->header)) /
+                  sizeof(xsdt->table_offset_entry[0]);
+
+    for ( i = 0; i < entry_count; i++ )
+    {
+        const struct acpi_table_header *hdr;
+
+        hdr = (const void *)xsdt->table_offset_entry[i];
+        if ( !hdr )
+            continue;
+
+        if ( memcmp(hdr->signature, ACPI_SIG_BGRT, 4) == 0 &&
+             hdr->length >= sizeof(struct acpi_table_bgrt) )
+            return (struct acpi_table_bgrt *)hdr;
+    }
+
+    return NULL;
+}
+
+#define BMP_SIGNATURE 0x4D42
+#define MAX_BGRT_IMAGE_SIZE (16 * 1024 * 1024)
+
+static void __init efi_preserve_bgrt_img(void)
+{
+    struct acpi_table_bgrt *bgrt;
+    const BMP_HEADER *bmp;
+    const void *old_image;
+    void *new_image;
+    UINTN image_size;
+    EFI_STATUS status;
+    UINT8 checksum;
+    unsigned int i;
+
+    bgrt_info.preserved = false;
+
+    bgrt = efi_get_bgrt();
+    if ( !bgrt )
+    {
+        bgrt_info.failure_reason = "BGRT table not found";
+        return;
+    }
+
+    if ( !bgrt->image_address )
+        return;
+
+    old_image = (const void *)bgrt->image_address;
+    bmp = old_image;
+
+    if ( bmp->signature != BMP_SIGNATURE )
+    {
+        bgrt_info.failure_reason = "Invalid BMP signature";
+        return;
+    }
+
+    image_size = bmp->file_size;
+    if ( !image_size || image_size > MAX_BGRT_IMAGE_SIZE )
+    {
+        bgrt_info.failure_reason = "Image size exceeds limit";
+        return;
+    }
+
+    /*
+     * Allocate memory of type EfiACPIReclaimMemory so that the image
+     * will remain available for the OS after ExitBootServices().
+     */
+    status = efi_bs->AllocatePool(EfiACPIReclaimMemory, image_size, &new_image);
+    if ( EFI_ERROR(status) )
+    {
+        bgrt_info.failure_reason = "Memory allocation failed";
+        return;
+    }
+    memcpy(new_image, old_image, image_size);
+    bgrt->image_address = (UINTN)new_image;
+    bgrt->header.checksum = 0;
+    checksum = 0;
+
+    for ( i = 0; i < bgrt->header.length; i++ )
+        checksum += ((const UINT8 *)bgrt)[i];
+
+    bgrt->header.checksum = -checksum;
+
+    /* Filling the debug struct for printing later */
+    bgrt_info.preserved = true;
+    bgrt_info.old_addr = old_image;
+    bgrt_info.new_addr = new_image;
+    bgrt_info.size = image_size;
 }
 
 /*
@@ -1670,6 +1801,8 @@ void EFIAPI __init noreturn efi_start(EFI_HANDLE ImageHandle,
         efi_set_gop_mode(gop, gop_mode);
 
     efi_relocate_esrt(SystemTable);
+
+    efi_preserve_bgrt_img();
 
     efi_exit_boot(ImageHandle, SystemTable);
 

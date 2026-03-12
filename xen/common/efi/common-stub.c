@@ -19,6 +19,7 @@ unsigned long efi_get_time(void)
 }
 
 void efi_reset_system(bool warm) { }
+void __init efi_bgrt_status_info(void) { }
 
 int efi_get_info(uint32_t idx, union xenpf_efi_info *info)
 {
